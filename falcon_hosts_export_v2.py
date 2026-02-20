@@ -292,15 +292,33 @@ def enrich_with_cid_names(host_details: list, cid_map: dict) -> list:
 
 # ── Host Group Name Resolution ──────────────────────────────────────────────
 
-def build_group_name_map(auth_kwargs: dict) -> dict:
+def build_group_name_map_from_hosts(auth_kwargs: dict, host_details: list) -> dict:
     """
-    Build a mapping of host group ID -> group name using the HostGroup API.
+    Build a mapping of host group ID -> group name by collecting all unique
+    group IDs found in host records and resolving them via get_host_groups().
 
-    Uses query_combined_host_groups to retrieve all groups with their details
-    (paginated). Returns a dict like {"abc123def456...": "My Host Group", ...}.
+    This approach is more reliable than query_combined_host_groups because it
+    resolves exactly the group IDs present in host data, regardless of tenant
+    scoping or pagination issues.
+
+    Returns a dict like {"abc123def456...": "My Host Group", ...}.
     Returns an empty dict if Host Group access is unavailable.
     """
     group_map = {}
+
+    # Step 1: Collect all unique group IDs from host records
+    all_group_ids = set()
+    for host in host_details:
+        group_ids = host.get("groups", []) or []
+        if isinstance(group_ids, str):
+            group_ids = [group_ids]
+        all_group_ids.update(group_ids)
+
+    if not all_group_ids:
+        print("  INFO: No group IDs found in host records. Group names column will be empty.")
+        return group_map
+
+    print(f"  Found {len(all_group_ids)} unique group ID(s) in host records. Resolving names...")
 
     try:
         hg = HostGroup(**auth_kwargs)
@@ -308,11 +326,13 @@ def build_group_name_map(auth_kwargs: dict) -> dict:
         print(f"  WARNING: Could not initialize HostGroup: {e}")
         return group_map
 
-    offset = 0
-    limit = 500
+    # Step 2: Resolve group IDs in batches via get_host_groups(ids=...)
+    group_id_list = list(all_group_ids)
+    batch_size = 500
 
-    while True:
-        response = hg.query_combined_host_groups(offset=offset, limit=limit)
+    for i in range(0, len(group_id_list), batch_size):
+        batch = group_id_list[i : i + batch_size]
+        response = hg.get_host_groups(ids=batch)
         status_code = response["status_code"]
 
         if status_code == 403:
@@ -320,26 +340,22 @@ def build_group_name_map(auth_kwargs: dict) -> dict:
             print("           Use --skip_group_lookup to suppress this warning.")
             return group_map
         elif status_code != 200:
-            print(f"  WARNING: query_combined_host_groups failed (HTTP {status_code}). Group names will be empty.")
-            return group_map
+            print(f"  WARNING: get_host_groups failed (HTTP {status_code}). Some group names may be missing.")
+            continue
 
         resources = response["body"].get("resources", [])
-        if not resources:
-            break
-
         for group in resources:
             group_id = group.get("id", "")
             group_name = group.get("name", "")
-            if group_id:
+            if group_id and group_name:
                 group_map[group_id] = group_name
 
-        total = response["body"].get("meta", {}).get("pagination", {}).get("total", 0)
-        offset += len(resources)
+    resolved = len(group_map)
+    unresolved = len(all_group_ids) - resolved
+    print(f"✓ Resolved {resolved} of {len(all_group_ids)} host group name(s)")
+    if unresolved > 0:
+        print(f"  WARNING: {unresolved} group ID(s) could not be resolved (may be deleted or inaccessible).")
 
-        if len(group_map) >= total:
-            break
-
-    print(f"✓ Resolved {len(group_map)} host group name(s)")
     return group_map
 
 
@@ -350,6 +366,9 @@ def enrich_with_group_names(host_details: list, group_map: dict) -> list:
     Multiple groups are joined with '; '.
     Unresolved IDs are omitted (they remain visible in the 'groups' column).
     """
+    resolved_count = 0
+    unresolved_ids = set()
+
     for host in host_details:
         group_ids = host.get("groups", []) or []
         if isinstance(group_ids, str):
@@ -357,11 +376,24 @@ def enrich_with_group_names(host_details: list, group_map: dict) -> list:
 
         names = []
         for gid in group_ids:
-            name = group_map.get(gid, "")
+            # Try exact match first, then lowercase
+            name = group_map.get(gid) or group_map.get(gid.lower(), "")
             if name:
                 names.append(name)
+                resolved_count += 1
+            else:
+                unresolved_ids.add(gid)
 
         host["group_names"] = "; ".join(names) if names else ""
+
+    if unresolved_ids:
+        print(f"  WARNING: {len(unresolved_ids)} unique group ID(s) from host records could not be resolved.")
+        sample = list(unresolved_ids)[:3]
+        print(f"           Sample unresolved IDs: {sample}")
+        if group_map:
+            sample_keys = list(group_map.keys())[:3]
+            print(f"           Sample group map keys: {sample_keys}")
+        print("           This may indicate the 'groups' field uses a different ID format than the Host Group API.")
 
     return host_details
 
@@ -565,30 +597,30 @@ def main():
     else:
         print("Skipping CID label resolution (--skip_cid_lookup)")
 
-    # Step 3: Resolve host group names (unless skipped)
-    group_map = {}
-    if not args.skip_group_lookup:
-        print("Resolving host group names...")
-        group_map = build_group_name_map(auth_kwargs)
-    else:
-        print("Skipping host group name resolution (--skip_group_lookup)")
-
-    # Step 4: Retrieve all host IDs (with optional filter)
+    # Step 3: Retrieve all host IDs (with optional filter)
     host_ids = get_all_host_ids(falcon, fql_filter=args.filter, sort=args.sort, hidden_only=args.hidden_only)
 
     if not host_ids:
         print("No hosts found matching the criteria.")
         sys.exit(0)
 
-    # Step 5: Fetch full details for each host
+    # Step 4: Fetch full details for each host
     host_details = get_host_details(falcon, host_ids, args.batch_size)
 
-    # Step 6: Enrich host records with CID names
+    # Step 5: Enrich host records with CID names
     if cid_map:
         host_details = enrich_with_cid_names(host_details, cid_map)
     else:
         for host in host_details:
             host.setdefault("cid_name", "")
+
+    # Step 6: Resolve host group names from IDs found in host records (unless skipped)
+    group_map = {}
+    if not args.skip_group_lookup:
+        print("Resolving host group names...")
+        group_map = build_group_name_map_from_hosts(auth_kwargs, host_details)
+    else:
+        print("Skipping host group name resolution (--skip_group_lookup)")
 
     # Step 7: Enrich host records with host group names
     host_details = enrich_with_group_names(host_details, group_map)
