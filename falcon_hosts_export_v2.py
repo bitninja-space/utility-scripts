@@ -292,69 +292,168 @@ def enrich_with_cid_names(host_details: list, cid_map: dict) -> list:
 
 # ── Host Group Name Resolution ──────────────────────────────────────────────
 
+def _fetch_groups_for_cid(auth_kwargs: dict, member_cid: str = None) -> list:
+    """
+    Fetch all host groups for a single CID (parent or child).
+    Returns a list of group resource dicts.
+    """
+    kwargs = dict(auth_kwargs)
+    if member_cid:
+        kwargs["member_cid"] = member_cid
+
+    try:
+        hg = HostGroup(**kwargs)
+    except Exception as e:
+        print(f"    WARNING: Could not initialize HostGroup for CID {member_cid or 'parent'}: {e}")
+        return []
+
+    all_groups = []
+    offset = 0
+    limit = 500
+
+    while True:
+        response = hg.query_combined_host_groups(offset=offset, limit=limit)
+        status_code = response["status_code"]
+
+        if status_code in (401, 403):
+            # No permission for this CID — skip silently
+            return all_groups
+        elif status_code != 200:
+            return all_groups
+
+        resources = response["body"].get("resources", [])
+        if not resources:
+            break
+
+        all_groups.extend(resources)
+        total = response["body"].get("meta", {}).get("pagination", {}).get("total", 0)
+        offset += len(resources)
+
+        if offset >= total:
+            break
+
+    return all_groups
+
+
 def build_group_name_map_from_hosts(auth_kwargs: dict, host_details: list) -> dict:
     """
-    Build a mapping of host group ID -> group name by collecting all unique
-    group IDs found in host records and resolving them via get_host_groups().
+    Build a mapping of group identifier -> group name.
 
-    This approach is more reliable than query_combined_host_groups because it
-    resolves exactly the group IDs present in host data, regardless of tenant
-    scoping or pagination issues.
+    In MSSP / Flight Control environments, host groups are defined at the
+    child CID level. Hosts exported from the parent contain group IDs that
+    belong to their respective child CIDs. To resolve them, this function:
 
-    Returns a dict like {"abc123def456...": "My Host Group", ...}.
-    Returns an empty dict if Host Group access is unavailable.
+      1. Collects all unique group IDs from host records
+      2. Fetches host groups from the parent CID
+      3. Discovers child CIDs via Flight Control
+      4. Fetches host groups from each child CID (authenticating with member_cid)
+      5. Indexes every group by all available identifier fields (id, group_hash)
+
+    Returns a dict mapping group identifiers to names.
     """
-    group_map = {}
-
     # Step 1: Collect all unique group IDs from host records
-    all_group_ids = set()
+    host_group_ids = set()
     for host in host_details:
         group_ids = host.get("groups", []) or []
         if isinstance(group_ids, str):
             group_ids = [group_ids]
-        all_group_ids.update(group_ids)
+        host_group_ids.update(group_ids)
 
-    if not all_group_ids:
+    if not host_group_ids:
         print("  INFO: No group IDs found in host records. Group names column will be empty.")
+        return {}
+
+    print(f"  Found {len(host_group_ids)} unique group ID(s) in host records.")
+
+    group_map = {}
+    group_count = 0
+
+    def index_groups(groups: list):
+        """Add groups to the map, indexed by every plausible identifier."""
+        nonlocal group_count
+        for group in groups:
+            group_name = group.get("name", "")
+            for key in ("id", "group_hash", "hash"):
+                val = group.get(key, "")
+                if val:
+                    group_map[val] = group_name
+                    group_map[val.lower()] = group_name
+            group_count += 1
+
+    # Step 2: Fetch host groups from the parent CID
+    print("  Fetching host groups from parent CID...")
+    parent_groups = _fetch_groups_for_cid(auth_kwargs)
+    index_groups(parent_groups)
+    print(f"    Found {len(parent_groups)} group(s) at parent level.")
+
+    # Check if we already resolved everything
+    resolved = sum(1 for gid in host_group_ids if gid in group_map or gid.lower() in group_map)
+    if resolved >= len(host_group_ids):
+        print(f"✓ Resolved all {resolved} group ID(s) from parent CID.")
         return group_map
 
-    print(f"  Found {len(all_group_ids)} unique group ID(s) in host records. Resolving names...")
+    # Step 3: Discover child CIDs via Flight Control and fetch their groups
+    print(f"  {len(host_group_ids) - resolved} group ID(s) unresolved. Checking child CIDs...")
 
     try:
-        hg = HostGroup(**auth_kwargs)
+        fc = FlightControl(**auth_kwargs)
+        all_child_cids = []
+        offset = 0
+
+        while True:
+            response = fc.query_children(offset=offset, limit=500)
+            if response["status_code"] != 200:
+                print("    WARNING: Could not query child CIDs. Some group names may be missing.")
+                break
+
+            resources = response["body"].get("resources", [])
+            if not resources:
+                break
+
+            all_child_cids.extend(resources)
+            total = response["body"].get("meta", {}).get("pagination", {}).get("total", 0)
+            offset += len(resources)
+            if len(all_child_cids) >= total:
+                break
+
+        if all_child_cids:
+            # Get child CID details to obtain actual child_cid values
+            child_cid_values = []
+            for i in range(0, len(all_child_cids), 500):
+                batch = all_child_cids[i : i + 500]
+                resp = fc.get_children(ids=batch)
+                if resp["status_code"] == 200:
+                    for child in resp["body"].get("resources", []):
+                        ccid = child.get("child_cid", "")
+                        if ccid:
+                            child_cid_values.append(ccid)
+
+            print(f"  Found {len(child_cid_values)} child CID(s). Fetching their host groups...")
+
+            for idx, ccid in enumerate(child_cid_values, 1):
+                child_groups = _fetch_groups_for_cid(auth_kwargs, member_cid=ccid)
+                if child_groups:
+                    index_groups(child_groups)
+                    print(f"    Child {idx}/{len(child_cid_values)} ({ccid[:8]}...): {len(child_groups)} group(s)")
+
+                # Check if we've resolved everything — stop early if so
+                resolved = sum(1 for gid in host_group_ids if gid in group_map or gid.lower() in group_map)
+                if resolved >= len(host_group_ids):
+                    break
+        else:
+            print("    No child CIDs found.")
+
     except Exception as e:
-        print(f"  WARNING: Could not initialize HostGroup: {e}")
-        return group_map
+        print(f"    WARNING: Flight Control lookup failed: {e}")
 
-    # Step 2: Resolve group IDs in batches via get_host_groups(ids=...)
-    group_id_list = list(all_group_ids)
-    batch_size = 500
+    # Final tally
+    resolved = sum(1 for gid in host_group_ids if gid in group_map or gid.lower() in group_map)
+    print(f"✓ Resolved {resolved} of {len(host_group_ids)} host group ID(s) across {group_count} total group(s).")
 
-    for i in range(0, len(group_id_list), batch_size):
-        batch = group_id_list[i : i + batch_size]
-        response = hg.get_host_groups(ids=batch)
-        status_code = response["status_code"]
-
-        if status_code == 403:
-            print("  WARNING: No Host Group Read permission. Group names will be empty.")
-            print("           Use --skip_group_lookup to suppress this warning.")
-            return group_map
-        elif status_code != 200:
-            print(f"  WARNING: get_host_groups failed (HTTP {status_code}). Some group names may be missing.")
-            continue
-
-        resources = response["body"].get("resources", [])
-        for group in resources:
-            group_id = group.get("id", "")
-            group_name = group.get("name", "")
-            if group_id and group_name:
-                group_map[group_id] = group_name
-
-    resolved = len(group_map)
-    unresolved = len(all_group_ids) - resolved
-    print(f"✓ Resolved {resolved} of {len(all_group_ids)} host group name(s)")
-    if unresolved > 0:
-        print(f"  WARNING: {unresolved} group ID(s) could not be resolved (may be deleted or inaccessible).")
+    if resolved < len(host_group_ids):
+        unresolved = [gid for gid in host_group_ids if gid not in group_map and gid.lower() not in group_map]
+        print(f"  WARNING: {len(unresolved)} group ID(s) could not be resolved (may be deleted or inaccessible).")
+        print(f"           Sample: {unresolved[:3]}")
 
     return group_map
 
