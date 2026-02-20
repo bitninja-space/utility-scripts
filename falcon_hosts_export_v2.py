@@ -348,6 +348,7 @@ def enrich_with_group_names(host_details: list, group_map: dict) -> list:
     Add a 'group_names' field to each host record.
     Resolves group IDs from the 'groups' field to their human-readable names.
     Multiple groups are joined with '; '.
+    Unresolved IDs are omitted (they remain visible in the 'groups' column).
     """
     for host in host_details:
         group_ids = host.get("groups", []) or []
@@ -357,7 +358,8 @@ def enrich_with_group_names(host_details: list, group_map: dict) -> list:
         names = []
         for gid in group_ids:
             name = group_map.get(gid, "")
-            names.append(name if name else gid)  # Fall back to raw ID if name not found
+            if name:
+                names.append(name)
 
         host["group_names"] = "; ".join(names) if names else ""
 
@@ -589,11 +591,7 @@ def main():
             host.setdefault("cid_name", "")
 
     # Step 7: Enrich host records with host group names
-    if group_map:
-        host_details = enrich_with_group_names(host_details, group_map)
-    else:
-        for host in host_details:
-            host.setdefault("group_names", "")
+    host_details = enrich_with_group_names(host_details, group_map)
 
     # Step 8: Export to CSV
     export_to_csv(host_details, args.output, all_fields=args.all_fields)
